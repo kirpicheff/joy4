@@ -2,12 +2,14 @@ package ts
 
 import (
 	"fmt"
+	"io"
+	"log"
+	"time"
+
 	"github.com/datarhei/joy4/av"
 	"github.com/datarhei/joy4/codec/aacparser"
 	"github.com/datarhei/joy4/codec/h264parser"
 	"github.com/datarhei/joy4/format/ts/tsio"
-	"io"
-	"time"
 )
 
 var CodecTypes = []av.CodecType{av.H264, av.AAC}
@@ -25,20 +27,43 @@ type Muxer struct {
 	nalus   [][]byte
 
 	tswpat, tswpmt *tsio.TSWriter
+
+	// Добавляем счетчики для периодической отправки PAT/PMT
+	patpmtCounter int
+	lastPATPMT    time.Time
+
+	// Отдельные счетчики для PAT и PMT
+	patCounter uint
+	pmtCounter uint
+
+	// Счетчик для относительного времени
+	startTime   time.Time
+	packetCount uint64
+
+	// Для отслеживания временных меток
+	lastVideoTime time.Duration
+	lastAudioTime time.Duration
 }
 
 func NewMuxer(w io.Writer) *Muxer {
-	return &Muxer{
-		w:       w,
-		psidata: make([]byte, 188),
-		peshdr:  make([]byte, tsio.MaxPESHeaderLength),
-		tshdr:   make([]byte, tsio.MaxTSHeaderLength),
-		adtshdr: make([]byte, aacparser.ADTSHeaderLength),
-		nalus:   make([][]byte, 16),
-		datav:   make([][]byte, 16),
-		tswpmt:  tsio.NewTSWriter(tsio.PMT_PID),
-		tswpat:  tsio.NewTSWriter(tsio.PAT_PID),
+	muxer := &Muxer{
+		w:          w,
+		psidata:    make([]byte, 188),
+		peshdr:     make([]byte, tsio.MaxPESHeaderLength),
+		tshdr:      make([]byte, tsio.MaxTSHeaderLength),
+		adtshdr:    make([]byte, aacparser.ADTSHeaderLength),
+		nalus:      make([][]byte, 16),
+		datav:      make([][]byte, 16),
+		tswpmt:     tsio.NewTSWriter(tsio.PMT_PID),
+		tswpat:     tsio.NewTSWriter(tsio.PAT_PID),
+		lastPATPMT: time.Now(),
 	}
+
+	// Возвращаем отдельные счетчики для PAT/PMT
+	muxer.tswpat.SetGlobalCounter(&muxer.patCounter)
+	muxer.tswpmt.SetGlobalCounter(&muxer.pmtCounter)
+
+	return muxer
 }
 
 func (self *Muxer) newStream(codec av.CodecData) (err error) {
@@ -135,6 +160,7 @@ func (self *Muxer) WritePATPMT() (err error) {
 		return
 	}
 
+	self.lastPATPMT = time.Now()
 	return
 }
 
@@ -153,8 +179,48 @@ func (self *Muxer) WriteHeader(streams []av.CodecData) (err error) {
 }
 
 func (self *Muxer) WritePacket(pkt av.Packet) (err error) {
+	// Инициализируем startTime при первом пакете
+	if self.startTime.IsZero() {
+		self.startTime = time.Now()
+	}
+
+	// ВОЗВРАЩАЕМ периодическую отправку PAT/PMT
+	if time.Since(self.lastPATPMT) > 1*time.Second {
+		if err = self.WritePATPMT(); err != nil {
+			return
+		}
+	}
+
 	stream := self.streams[pkt.Idx]
-	pkt.Time += time.Second
+
+	// Логирование для диагностики временных меток
+	if stream.Type() == av.H264 {
+		// Проверяем промежуток между видео кадрами
+		if self.lastVideoTime > 0 {
+			timeDiff := pkt.Time - self.lastVideoTime
+			if timeDiff > time.Second {
+				log.Printf("WARNING: Large video time gap: %v between frames", timeDiff)
+			}
+		}
+		self.lastVideoTime = pkt.Time
+
+		log.Printf("VIDEO packet: time=%v, isKeyFrame=%v, compositionTime=%v, packetCount=%d",
+			pkt.Time, pkt.IsKeyFrame, pkt.CompositionTime, self.packetCount)
+	} else if stream.Type() == av.AAC {
+		// Проверяем промежуток между аудио пакетами
+		if self.lastAudioTime > 0 {
+			timeDiff := pkt.Time - self.lastAudioTime
+			if timeDiff > time.Second {
+				log.Printf("WARNING: Large audio time gap: %v between packets", timeDiff)
+			}
+		}
+		self.lastAudioTime = pkt.Time
+
+		log.Printf("AUDIO packet: time=%v, packetCount=%d", pkt.Time, self.packetCount)
+	}
+
+	// Используем оригинальные временные метки без сложной конвертации
+	originalTime := pkt.Time
 
 	switch stream.Type() {
 	case av.AAC:
@@ -166,7 +232,12 @@ func (self *Muxer) WritePacket(pkt av.Packet) (err error) {
 		self.datav[1] = self.adtshdr
 		self.datav[2] = pkt.Data
 
-		if err = stream.tsw.WritePackets(self.w, self.datav[:3], pkt.Time, true, false); err != nil {
+		// ВОЗВРАЩАЕМ PCR для аудио пакетов с простым временем
+		pcrTime := time.Duration(0)
+		if self.packetCount%100 == 0 { // Каждые 100 пакетов
+			pcrTime = time.Duration(self.packetCount) * time.Millisecond // Простое время
+		}
+		if err = stream.tsw.WritePackets(self.w, self.datav[:3], pcrTime, true, false); err != nil {
 			return
 		}
 
@@ -196,10 +267,20 @@ func (self *Muxer) WritePacket(pkt av.Packet) (err error) {
 		n := tsio.FillPESHeader(self.peshdr, tsio.StreamIdH264, -1, pkt.Time+pkt.CompositionTime, pkt.Time)
 		datav[0] = self.peshdr[:n]
 
-		if err = stream.tsw.WritePackets(self.w, datav, pkt.Time, pkt.IsKeyFrame, false); err != nil {
+		// ВОЗВРАЩАЕМ PCR для видео с простым временем
+		pcrTime := time.Duration(0)
+		if pkt.IsKeyFrame && self.packetCount%100 == 0 {
+			pcrTime = time.Duration(self.packetCount) * time.Millisecond // Простое время
+		}
+		if err = stream.tsw.WritePackets(self.w, datav, pcrTime, pkt.IsKeyFrame, false); err != nil {
 			return
 		}
 	}
 
+	// Увеличиваем счетчик пакетов
+	self.packetCount++
+
+	// Восстанавливаем оригинальное время для корректности
+	pkt.Time = originalTime
 	return
 }

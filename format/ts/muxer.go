@@ -28,19 +28,19 @@ type Muxer struct {
 
 	tswpat, tswpmt *tsio.TSWriter
 
-	// Добавляем счетчики для периодической отправки PAT/PMT
+	// Add counters for periodic PAT/PMT sending
 	patpmtCounter int
 	lastPATPMT    time.Time
 
-	// Отдельные счетчики для PAT и PMT
+	// Separate counters for PAT and PMT
 	patCounter uint
 	pmtCounter uint
 
-	// Счетчик для относительного времени
+	// Counter for relative time
 	startTime   time.Time
 	packetCount uint64
 
-	// Для отслеживания временных меток
+	// For tracking timestamps
 	lastVideoTime time.Duration
 	lastAudioTime time.Duration
 }
@@ -59,7 +59,7 @@ func NewMuxer(w io.Writer) *Muxer {
 		lastPATPMT: time.Now(),
 	}
 
-	// Возвращаем отдельные счетчики для PAT/PMT
+	// Return separate counters for PAT/PMT
 	muxer.tswpat.SetGlobalCounter(&muxer.patCounter)
 	muxer.tswpmt.SetGlobalCounter(&muxer.pmtCounter)
 
@@ -179,12 +179,12 @@ func (self *Muxer) WriteHeader(streams []av.CodecData) (err error) {
 }
 
 func (self *Muxer) WritePacket(pkt av.Packet) (err error) {
-	// Инициализируем startTime при первом пакете
+	// Initialize startTime on the first packet
 	if self.startTime.IsZero() {
 		self.startTime = time.Now()
 	}
 
-	// ВОЗВРАЩАЕМ периодическую отправку PAT/PMT
+	// Periodically send PAT/PMT
 	if time.Since(self.lastPATPMT) > 1*time.Second {
 		if err = self.WritePATPMT(); err != nil {
 			return
@@ -193,9 +193,9 @@ func (self *Muxer) WritePacket(pkt av.Packet) (err error) {
 
 	stream := self.streams[pkt.Idx]
 
-	// Логирование для диагностики временных меток
+	// Diagnostics for timestamp gaps
 	if stream.Type() == av.H264 {
-		// Проверяем промежуток между видео кадрами
+		// Check interval between video frames
 		if self.lastVideoTime > 0 {
 			timeDiff := pkt.Time - self.lastVideoTime
 			if timeDiff > time.Second {
@@ -203,11 +203,8 @@ func (self *Muxer) WritePacket(pkt av.Packet) (err error) {
 			}
 		}
 		self.lastVideoTime = pkt.Time
-
-		log.Printf("VIDEO packet: time=%v, isKeyFrame=%v, compositionTime=%v, packetCount=%d",
-			pkt.Time, pkt.IsKeyFrame, pkt.CompositionTime, self.packetCount)
 	} else if stream.Type() == av.AAC {
-		// Проверяем промежуток между аудио пакетами
+		// Check interval between audio packets
 		if self.lastAudioTime > 0 {
 			timeDiff := pkt.Time - self.lastAudioTime
 			if timeDiff > time.Second {
@@ -215,11 +212,9 @@ func (self *Muxer) WritePacket(pkt av.Packet) (err error) {
 			}
 		}
 		self.lastAudioTime = pkt.Time
-
-		log.Printf("AUDIO packet: time=%v, packetCount=%d", pkt.Time, self.packetCount)
 	}
 
-	// Используем оригинальные временные метки без сложной конвертации
+	// Use original timestamps without complex conversion
 	originalTime := pkt.Time
 
 	switch stream.Type() {
@@ -232,10 +227,10 @@ func (self *Muxer) WritePacket(pkt av.Packet) (err error) {
 		self.datav[1] = self.adtshdr
 		self.datav[2] = pkt.Data
 
-		// ВОЗВРАЩАЕМ PCR для аудио пакетов с простым временем
+		// Return PCR for audio packets with simple time
 		pcrTime := time.Duration(0)
-		if self.packetCount%100 == 0 { // Каждые 100 пакетов
-			pcrTime = time.Duration(self.packetCount) * time.Millisecond // Простое время
+		if self.packetCount%100 == 0 { // Every 100 packets
+			pcrTime = time.Duration(self.packetCount) * time.Millisecond // Simple time
 		}
 		if err = stream.tsw.WritePackets(self.w, self.datav[:3], pcrTime, true, false); err != nil {
 			return
@@ -267,20 +262,20 @@ func (self *Muxer) WritePacket(pkt av.Packet) (err error) {
 		n := tsio.FillPESHeader(self.peshdr, tsio.StreamIdH264, -1, pkt.Time+pkt.CompositionTime, pkt.Time)
 		datav[0] = self.peshdr[:n]
 
-		// ВОЗВРАЩАЕМ PCR для видео с простым временем
+		// Return PCR for video with simple time
 		pcrTime := time.Duration(0)
 		if pkt.IsKeyFrame && self.packetCount%100 == 0 {
-			pcrTime = time.Duration(self.packetCount) * time.Millisecond // Простое время
+			pcrTime = time.Duration(self.packetCount) * time.Millisecond // Simple time
 		}
 		if err = stream.tsw.WritePackets(self.w, datav, pcrTime, pkt.IsKeyFrame, false); err != nil {
 			return
 		}
 	}
 
-	// Увеличиваем счетчик пакетов
+	// Increment packet count
 	self.packetCount++
 
-	// Восстанавливаем оригинальное время для корректности
+	// Restore original time for correctness
 	pkt.Time = originalTime
 	return
 }

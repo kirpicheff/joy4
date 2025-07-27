@@ -40,6 +40,10 @@ type Muxer struct {
 	startTime   time.Time
 	packetCount uint64
 
+	// For tracking PCR generation
+	pcrPID      uint16
+	lastPCRTime time.Duration
+
 	// For tracking timestamps
 	lastVideoTime time.Duration
 	lastAudioTime time.Duration
@@ -172,6 +176,11 @@ func (self *Muxer) WriteHeader(streams []av.CodecData) (err error) {
 		}
 	}
 
+	// Set the PCR PID to the first stream's PID (usually video)
+	if len(self.streams) > 0 {
+		self.pcrPID = self.streams[0].pid
+	}
+
 	if err = self.WritePATPMT(); err != nil {
 		return
 	}
@@ -192,6 +201,17 @@ func (self *Muxer) WritePacket(pkt av.Packet) (err error) {
 	}
 
 	stream := self.streams[pkt.Idx]
+
+	// Correct PCR generation logic.
+	// The PCR should be derived from the actual stream timestamps and sent periodically.
+	var pcrTime time.Duration
+	if stream.pid == self.pcrPID {
+		// MPEG-TS spec suggests PCR interval should be <= 100ms. We use 80ms.
+		if self.lastPCRTime == 0 || (pkt.Time-self.lastPCRTime) > 80*time.Millisecond {
+			pcrTime = pkt.Time
+			self.lastPCRTime = pkt.Time
+		}
+	}
 
 	// Diagnostics for timestamp gaps
 	if stream.Type() == av.H264 {
@@ -227,12 +247,8 @@ func (self *Muxer) WritePacket(pkt av.Packet) (err error) {
 		self.datav[1] = self.adtshdr
 		self.datav[2] = pkt.Data
 
-		// Return PCR for audio packets with simple time
-		pcrTime := time.Duration(0)
-		if self.packetCount%100 == 0 { // Every 100 packets
-			pcrTime = time.Duration(self.packetCount) * time.Millisecond // Simple time
-		}
-		if err = stream.tsw.WritePackets(self.w, self.datav[:3], pcrTime, true, false); err != nil {
+		// Do not send PCR with audio packets. It's handled by the video stream.
+		if err = stream.tsw.WritePackets(self.w, self.datav[:3], 0, true, false); err != nil {
 			return
 		}
 
@@ -262,11 +278,7 @@ func (self *Muxer) WritePacket(pkt av.Packet) (err error) {
 		n := tsio.FillPESHeader(self.peshdr, tsio.StreamIdH264, -1, pkt.Time+pkt.CompositionTime, pkt.Time)
 		datav[0] = self.peshdr[:n]
 
-		// Return PCR for video with simple time
-		pcrTime := time.Duration(0)
-		if pkt.IsKeyFrame && self.packetCount%100 == 0 {
-			pcrTime = time.Duration(self.packetCount) * time.Millisecond // Simple time
-		}
+		// Pass the correctly calculated pcrTime. It will be non-zero only when needed.
 		if err = stream.tsw.WritePackets(self.w, datav, pcrTime, pkt.IsKeyFrame, false); err != nil {
 			return
 		}
